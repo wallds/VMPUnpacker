@@ -187,9 +187,10 @@ def to_hex_string(val, prefix=True):
     return f"0x{val:x}" if prefix else f"{val:x}"
 
 
-def find_vmp_section(pe, characteristics=0x68000060) -> pefile.SectionStructure:
-    for section in pe.sections:
-        if section.Characteristics == characteristics:
+def find_vmp_section(pe) -> pefile.SectionStructure:
+    for section in reversed(pe.sections):
+        if section.SizeOfRawData and section.PointerToRawData and \
+            section.IMAGE_SCN_MEM_EXECUTE and section.IMAGE_SCN_MEM_READ and not section.IMAGE_SCN_MEM_WRITE:
             return section
     return None
 
@@ -472,13 +473,13 @@ def parse_va_list(s):
     return [int(x, 0) for x in s.split(',') if x.strip()]
 
 
-def find_import_descriptors(pe, key, section_chars):
+def find_import_descriptors(pe, key):
     """Locate the VMP import-descriptor block.
 
     Returns ``(dll_info_rva, [(dll_name, [(api, slot_rva, key), ...]), ...])``
     or ``(None, [])`` when nothing valid is found.
     """
-    vmp_section = find_vmp_section(pe, section_chars)
+    vmp_section = find_vmp_section(pe)
     if vmp_section is None:
         return None, []
     mm = pe.get_memory_mapped_image()
@@ -496,9 +497,8 @@ def find_import_descriptors(pe, key, section_chars):
     return best_ea, parse_import_descriptors(mm, mapped, key, best_ea)
 
 
-def build_import_map(pe, key, section_chars):
+def build_import_map(dlls):
     """Map IAT slot RVA -> 'DLL!api' using dump_imports' descriptor parser."""
-    _, dlls = find_import_descriptors(pe, key, section_chars)
     result = {}
     for dll_name, apis in dlls:
         for api, address, _ in apis:
@@ -527,6 +527,11 @@ def build_fix_section(pe, dlls, sites):
         blob.extend(b'\0' * ((-len(blob)) % align))
         return sec_va + off
 
+    is_x64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+    if is_x64:
+        align_size = 8
+    else:
+        align_size = 4
     # Group imports by DLL, preserving first-seen order (a DLL can appear in
     # several VMP descriptor blocks).
     dll_order = []
@@ -550,18 +555,21 @@ def build_fix_section(pe, dlls, sites):
     iat_size = 0
     for dll_name in dll_order:
         entries = dll_imports[dll_name]
-        base = alloc(b'\0' * (8 * len(entries)))
+        base = alloc(b'\0' * (8 * len(entries)), align_size)
         iat_rva[dll_name] = base
-        iat_size += 8 * len(entries)
+        iat_size += align_size * len(entries)
         for idx, (api, slot) in enumerate(entries):
-            slot_va[slot] = base + idx * 8
+            slot_va[slot] = base + idx * align_size
     iat_start = iat_rva[dll_order[0]] if dll_order else None
 
     # Redirect stubs for call sites without room for a 6-byte call/jmp.
     stub_va = {}
     for rva, kind, api, slot, size in sites:
-        stub = struct.pack('<BB', 0xFF, 0x25) + struct.pack(
-            '<i', slot_va[slot] - (sec_va + len(blob) + 6))
+        stub = struct.pack('<BB', 0xFF, 0x25)
+        if is_x64:
+            stub += struct.pack('<i', slot_va[slot] - (sec_va + len(blob) + 6))
+        else:
+            stub += struct.pack('<i', slot_va[slot] + pe.OPTIONAL_HEADER.ImageBase)
         stub_va[(api, slot)] = alloc(stub)
 
     name_rva = {}
@@ -574,14 +582,21 @@ def build_fix_section(pe, dlls, sites):
         arr = bytearray()
         for api, slot in dll_imports[dll_name]:
             if api.startswith('ordinal_'):
-                arr.extend(struct.pack('<Q', IMAGE_ORDINAL_FLAG64
-                                       | int(api.rsplit('_', 1)[1])))
+                if is_x64:
+                    arr.extend(struct.pack('<Q', IMAGE_ORDINAL_FLAG64
+                                        | int(api.rsplit('_', 1)[1])))
+                else:
+                    arr.extend(struct.pack('<I', IMAGE_ORDINAL_FLAG32
+                                        | int(api.rsplit('_', 1)[1])))
             else:
                 hn_rva = alloc(struct.pack('<H', 0) + api.encode('latin-1')
-                               + b'\0', align=8)
-                arr.extend(struct.pack('<Q', hn_rva))
-        arr.extend(b'\0' * 8)
-        oft_rva[dll_name] = alloc(bytes(arr), align=8)
+                               + b'\0', align=align_size)
+                if is_x64:
+                    arr.extend(struct.pack('<Q', hn_rva))
+                else:
+                    arr.extend(struct.pack('<I', hn_rva))
+        arr.extend(b'\0' * align_size)
+        oft_rva[dll_name] = alloc(bytes(arr), align=align_size)
 
     desc_off = len(blob)
     for dll_name in dll_order:
@@ -632,16 +647,20 @@ def add_section(data, pe, blob, name='idata', chars=0xC0000040):
     return bytes(out)
 
 
-def fix_imports(data, pe, key, section_chars, code_rva, internal_stub_rvas=(),
+def fix_imports(data, pe, key, code_rva, internal_stub_rvas=(),
                 verbose=False):
     """Rebuild the import table, patch the call sites and write a fixed PE.
     """
-    dll_info, dlls = find_import_descriptors(pe, key, section_chars)
+    dll_info, dlls = find_import_descriptors(pe, key)
     if dll_info is None:
         raise SystemExit('no import descriptors found')
     print(f'import descriptors at {dll_info:#x}, {len(dlls)} DLLs')
+    if verbose:
+        for dll_name, apis in dlls:
+            for api, slot, key_ in apis:
+                print(f'{dll_name} {api} {slot:#x} {key_:#x}')
 
-    import_map = build_import_map(pe, key, section_chars)
+    import_map = build_import_map(dlls)
     code_section, code_rva = find_code_section(pe, code_rva)
     sites = classify_sites(pe, import_map, code_section, code_rva,
                            internal_stub_rvas, verbose)
@@ -658,8 +677,11 @@ def fix_imports(data, pe, key, section_chars, code_rva, internal_stub_rvas=(),
         at = rva
         if size >= 6:
             opcode = b'\xFF\x15' if kind == 'CALL' else b'\xFF\x25'
-            patch = opcode + struct.pack(
-                '<i', base + slot_va[slot] - (base + at + 6))
+            if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
+                patch = opcode + struct.pack(
+                    '<i', base + slot_va[slot] - (base + at + 6))
+            else:
+                patch = opcode + struct.pack('<I', base + slot_va[slot])
             out[pe.get_offset_from_rva(at):pe.get_offset_from_rva(at) + 6] = patch
         else:
             opcode = b'\xE8' if kind == 'CALL' else b'\xE9'
@@ -711,7 +733,11 @@ class Emu:
         self.import_map = import_map or {}
         self.verbose = verbose
         base = pe.OPTIONAL_HEADER.ImageBase
-        uc = Uc(UC_ARCH_X86, UC_MODE_64)
+        self.is_x64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+        if self.is_x64:
+            uc = Uc(UC_ARCH_X86, UC_MODE_64)
+        else:
+            uc = Uc(UC_ARCH_X86, UC_MODE_32)
         for section in pe.sections:
             if not section.SizeOfRawData:
                 continue
@@ -733,8 +759,9 @@ class Emu:
         self.stack_address = 0x100000
         self.stack_size = 0x20000
         self.stack_init = self.stack_address + self.stack_size - 0x1000
+        self.stack_reg = UC_X86_REG_RSP if self.is_x64 else UC_X86_REG_ESP
         uc.mem_map(self.stack_address, self.stack_size)
-        uc.reg_write(UC_X86_REG_RSP, self.stack_init)
+        uc.reg_write(self.stack_reg, self.stack_init)
         # uc.hook_add(UC_HOOK_CODE, hook_code, self)
         uc.hook_add(UC_HOOK_MEM_READ, hook_mem_read, self,
                     base, base + pe.OPTIONAL_HEADER.SizeOfImage)
@@ -763,7 +790,7 @@ class Emu:
         except Exception as e:
             self.last['stop'] = str(e) if isinstance(e, UcError) else repr(e)
             try:
-                self.last['rip'] = self.uc.reg_read(UC_X86_REG_RIP)
+                self.last['rip'] = self.uc.reg_read(UC_X86_REG_RIP if self.is_x64 else UC_X86_REG_EIP)
             except Exception:
                 pass
         result = self._classify(address)
@@ -792,7 +819,7 @@ class Emu:
         target = self.resolve_import(read_addr)
         self.read_addr = read_addr
 
-        rsp = self.uc.reg_read(UC_X86_REG_RSP)
+        rsp = self.uc.reg_read(self.stack_reg)
         delta_rsp = rsp - self.stack_init
 
         try:
@@ -802,35 +829,40 @@ class Emu:
         is_push_reg = prev_code is not None and 0x50 <= prev_code <= 0x57
 
         size = 6
-        return_address = struct.unpack('<Q', self.uc.mem_read(rsp, 8))[0]
+        if self.is_x64:
+            return_address = struct.unpack('<Q', self.uc.mem_read(rsp, 8))[0]
+            address_size = 8
+        else:
+            return_address = struct.unpack('<I', self.uc.mem_read(rsp, 4))[0]
+            address_size = 4
         if return_address:
             delta_rip = return_address - address
-            if delta_rip == 6 and delta_rsp == -8:
+            if delta_rip == 6 and delta_rsp == -address_size:
                 kind = 'CALL'
             elif delta_rip == 5 and delta_rsp == 0:
                 if not is_push_reg:
                     self.last['reason'] = ('return addr +5, rsp balanced, but '
-                                           'no preceding push register')
+                                        'no preceding push register')
                     return
                 kind = 'CALL'
                 address -= 1
-            elif delta_rip == 5 and delta_rsp == -8:
+            elif delta_rip == 5 and delta_rsp == -address_size:
                 kind = 'CALL'
                 size = 5
             else:
                 self.last['reason'] = (f'return address={return_address:#x} '
-                                       f'delta_rip={delta_rip:#x} '
-                                       f'delta_rsp={delta_rsp:#x}')
+                                    f'delta_rip={delta_rip:#x} '
+                                    f'delta_rsp={delta_rsp:#x}')
                 return
         else:
             if delta_rsp == 0:
                 kind = 'JMP'
-            elif delta_rsp == 8 and is_push_reg:
+            elif delta_rsp == address_size and is_push_reg:
                 kind = 'JMP'
                 address -= 1
             else:
                 self.last['reason'] = (f'no return address, '
-                                       f'delta_rsp={delta_rsp:#x}')
+                                    f'delta_rsp={delta_rsp:#x}')
                 return
         self.last['slot'] = read_addr - self.pe.OPTIONAL_HEADER.ImageBase
         return address, kind, target, size
@@ -910,8 +942,6 @@ def main():
     parser.add_argument('file', help='path to the VMProtect-protected PE file')
     parser.add_argument('-k', '--key', type=lambda s: int(s, 0), default=0,
                         help='string decryption key (default: 0)')
-    parser.add_argument('--section-chars', type=lambda s: int(s, 0), default=0x68000060,
-                        help='characteristics of the VMP section (default: 0x68000060)')
     parser.add_argument('--code-rva', type=lambda s: int(s, 0), default=None,
                         help='code section RVA to scan (default: first executable code section)')
     parser.add_argument('--internal-stubs', type=parse_va_list, default=[],
@@ -953,10 +983,6 @@ def main():
 
         print("Fixing imports...")
         pe = pefile.PE(data=unpacked_data, fast_load=True)
-        
-        if pe.FILE_HEADER.Machine != pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
-            print("Import table repair only supports AMD64 binaries")
-            return 0
         base = pe.OPTIONAL_HEADER.ImageBase
         key = args.key if args.key else find_key(pe)
         print('key:', hex(key))
@@ -964,8 +990,7 @@ def main():
             return 0
         internal_rvas = [va - base if va >= base else va for va in args.internal_stubs]
         output_filepath = args.file + '.fixed'
-        output_data = fix_imports(unpacked_data, pe, key, args.section_chars, 
-                                    args.code_rva, internal_rvas, args.verbose)
+        output_data = fix_imports(unpacked_data, pe, key, args.code_rva, internal_rvas, args.verbose)
         with open(output_filepath, 'wb') as f:
             f.write(output_data)
         print(f"Fixed: {output_filepath}")
