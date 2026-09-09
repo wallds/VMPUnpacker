@@ -105,74 +105,63 @@ def decrypt_string(mm, rva, key, max_len=0x100):
     return bytes(out)
 
 
-def count_valid_dll_descriptors(mm, mapped, dll_info, max_dlls=100):
-    """Count consecutive DLL import-descriptor entries starting at ``dll_info``.
+def _iter_import_descriptors_raw(mm, mapped, dll_info, max_dlls=100):
+    """Yield ``(dll_name_rva, [(name, slot_rva, key), ...])`` per valid
+    DLL import-descriptor starting at ``dll_info``.
 
-    Returns the number of fully validated DLL entries before the first
-    invalid one (mirrors the original script's early-exit behavior).
+    Stops at the first invalid entry (mirrors the original early-exit
+    behavior). Entries are raw RVAs; callers that need plaintext must
+    decrypt them with the packing key.
     """
     u32 = _U32.unpack_from
     size = len(mm)
-    count = 0
     for _ in range(max_dlls):
         if dll_info + 4 > size:
-            return count
+            return
         dll_name_rva = u32(mm, dll_info)[0]
         if dll_name_rva not in mapped:
-            return count
+            return
+        apis = []
         import_info = dll_info + 4
         while True:
             if import_info + 12 > size:
-                return count
+                return
             name = u32(mm, import_info)[0]
             if name == 0:
                 import_info += 4
                 break
             if not (name & IMAGE_ORDINAL_FLAG32) and name not in mapped:
-                return count
+                return
+            slot_rva = u32(mm, import_info + 4)[0]
+            key = u32(mm, import_info + 8)[0]
+            apis.append((name, slot_rva, key))
             import_info += IMPORT_ENTRY_SIZE
         dll_info = import_info
-        count += 1
-    return count
+        yield dll_name_rva, apis
+
+
+def count_valid_dll_descriptors(mm, mapped, dll_info, max_dlls=100):
+    """Count consecutive DLL import-descriptor entries starting at ``dll_info``."""
+    return sum(1 for _ in _iter_import_descriptors_raw(mm, mapped, dll_info, max_dlls))
 
 
 def parse_import_descriptors(mm, mapped, key, dll_info, max_dlls=100):
     """Parse the full DLL import-descriptor chain starting at ``dll_info``.
 
-    Returns a list of ``(dll_name, [(api, address, key), ...])`` tuples,
+    Returns a list of ``(dll_name, [(api, slot_rva, key), ...])`` tuples,
     truncated at the first invalid entry.
     """
-    u32 = _U32.unpack_from
-    size = len(mm)
     result = []
-    for _ in range(max_dlls):
-        if dll_info + 4 > size:
-            break
-        dll_name_rva = u32(mm, dll_info)[0]
-        if dll_name_rva not in mapped:
-            break
+    for dll_name_rva, apis in _iter_import_descriptors_raw(mm, mapped, dll_info, max_dlls):
         dll_name = decrypt_string(mm, dll_name_rva, key).decode('latin-1')
-        apis = []
-        import_info = dll_info + 4
-        while True:
-            if import_info + 12 > size:
-                return result
-            name = u32(mm, import_info)[0]
-            if name == 0:
-                import_info += 4
-                break
-            if not (name & IMAGE_ORDINAL_FLAG32) and name not in mapped:
-                return result
-            address = u32(mm, import_info + 4)[0]
-            key_ = u32(mm, import_info + 8)[0]
+        parsed = []
+        for name, slot_rva, key_ in apis:
             if name & IMAGE_ORDINAL_FLAG32:
                 api = f'ordinal_{name & 0xFFFF}'
             else:
                 api = decrypt_string(mm, name, key).decode('latin-1')
-            apis.append((api, address, key_))
-            import_info += IMPORT_ENTRY_SIZE
-        dll_info = import_info
-        result.append((dll_name, apis))
+            parsed.append((api, slot_rva, key_))
+        result.append((dll_name, parsed))
     return result
 
 
@@ -350,30 +339,12 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
                     raise RuntimeError(f"Block {block_idx}: PACKER_INFO.Dst (decompression target RVA {to_hex_string(uncompressed_target_rva)}) "
                                       f"exceeds image boundary ({to_hex_string(size_of_image)}).")
                 
-                # Use Python's lzma module to decompress data
-                # Note: We need to construct a properly formatted LZMA stream
-                lc = lzma_props_data[0] % 9
-                lp = (lzma_props_data[0] // 9) % 5
-                pb = lzma_props_data[0] // 45
-                dict_size = int.from_bytes(lzma_props_data[1:5], byteorder='little')
-                
-                # Build LZMA compression filter
-                filters = [
-                    {
-                        "id": lzma.FILTER_LZMA1,
-                        "dict_size": dict_size,
-                        "lc": lc,
-                        "lp": lp,
-                        "pb": pb
-                    }
-                ]
-                
                 # Create an LZMA decompressor
-                decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=filters)
+                decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
                 
                 # Decompress data
                 try:
-                    decompressed_data = decompressor.decompress(compressed_data)
+                    decompressed_data = decompressor.decompress(lzma_props_data+b'\xFF'*8+compressed_data)
                     
                     # Write decompressed data to target location
                     available_space = size_of_image - uncompressed_target_rva
@@ -395,28 +366,31 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
     return bytes(unpacked_image)
 
 
+def derive_key_hints_at_offset(image, known_plaintext, rva, offset=0):
+    if not known_plaintext:
+        return
+    key_leak = 0
+    key_mask = 0
+    prev_byte = None
+    for i, expected in enumerate(known_plaintext):
+        n = offset + i
+        if rva + n >= len(image):
+            return
+        byte = image[rva + n] ^ expected
+        byte = (byte - n) & 0xFF
+        if prev_byte is not None and (prev_byte & 0x7F) != (byte >> 1):
+            return
+        key_leak |= ror32(byte, n)
+        key_mask |= ror32(0xFF, n)
+        prev_byte = byte
+    return offset, key_leak, key_mask
+
+
 def derive_key_hints(image, known_plaintext, rva):
     for offset in range(0x100):
-        key_leak = 0
-        key_mask = 0
-        prev_byte = None
-        found = True
-        for j, expected in enumerate(known_plaintext):
-            n = offset + j
-            if rva + n >= len(image):
-                found = False
-                break
-            byte = image[rva + n] ^ expected
-            byte = (byte - n) & 0xFF
-            if prev_byte is not None and (prev_byte & 0x7F) != (byte >> 1):
-                found = False
-                break
-            key_leak |= ror32(byte, n)
-            key_mask |= ror32(0xFF, n)
-            prev_byte = byte
-        if found:
-            return offset, key_leak, key_mask
-    raise ValueError('no consistent offset found for known plaintext')
+        result = derive_key_hints_at_offset(image, known_plaintext, rva, offset)
+        if result is not None:
+            return result
 
 
 def find_key(pe):
@@ -442,29 +416,42 @@ def find_key(pe):
         print('no descriptor candidates found')
         return 0
 
-    rva_dll_name = _U32.unpack_from(image, best_rva)[0]
-    rva_api_name = _U32.unpack_from(image, best_rva + 4)[0]
+    first_dll_name_rva = _U32.unpack_from(image, best_rva)[0]
+    first_api_name_rva = _U32.unpack_from(image, best_rva + 4)[0]
 
-    try:
-        offset, key_leak, key_mask = derive_key_hints(image, KNOWN_PLAINTEXT, rva_dll_name)
-    except ValueError as exc:
-        print(exc)
-        return 0
-    print('found offset', offset, hex(key_leak), hex(key_mask))
-    pos = code.find(b'\xB8')
-    while pos != -1 and pos + 5 <= len(code):
-        ea = sec_start + pos
-        # mov eax, key
-        key = _U32.unpack_from(code, pos + 1)[0]
-        if (key & key_mask) == key_leak:
-            try:
-                dll_name = decrypt_string(image, rva_dll_name, key).decode()
-                api_name = decrypt_string(image, rva_api_name, key).decode()
-                if dll_name and dll_name.isprintable() and api_name and api_name.isprintable():
-                    return key
-            except Exception:
-                pass
-        pos = code.find(b'\xB8', pos + 1)
+    if result := derive_key_hints(image, KNOWN_PLAINTEXT, first_dll_name_rva):
+        offset, key_leak, key_mask = result
+        print('found offset', offset, hex(key_leak), hex(key_mask))
+        pos = code.find(b'\xB8')
+        while pos != -1 and pos + 5 <= len(code):
+            ea = sec_start + pos
+            # mov eax, key
+            key = _U32.unpack_from(code, pos + 1)[0]
+            if (key & key_mask) == key_leak:
+                try:
+                    dll_name = decrypt_string(image, first_dll_name_rva, key).decode()
+                    api_name = decrypt_string(image, first_api_name_rva, key).decode()
+                    if dll_name and dll_name.isprintable() and api_name and api_name.isprintable():
+                        return key
+                except Exception:
+                    pass
+            pos = code.find(b'\xB8', pos + 1)
+
+    # 3.10.6
+    for dll_name_rva, apis in _iter_import_descriptors_raw(image, mapped, best_rva):
+        result = derive_key_hints_at_offset(image, b'api-ms-win-crt-heap-l1-1-0.dll', dll_name_rva)
+        if result is not None:
+            offset, key_leak, key_mask = result
+            if key_mask == 0xffffffff:
+                return key_leak
+        for api_name_rva, _, _ in apis:
+            if api_name_rva & IMAGE_ORDINAL_FLAG32:
+                continue
+            result = derive_key_hints_at_offset(image, b'InitializeCriticalSection', api_name_rva)
+            if result is not None:
+                offset, key_leak, key_mask = result
+                if key_mask == 0xffffffff:
+                    return key_leak
     return 0
 
 
