@@ -7,7 +7,7 @@ import ctypes
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import io
-import pefile  # Added pefile library import
+import lief
 import numpy as np
 import argparse
 from bisect import bisect_right
@@ -18,13 +18,7 @@ from unicorn.x86_const import *
 IMAGE_DOS_SIGNATURE = 0x5A4D  # MZ
 IMAGE_NT_SIGNATURE = 0x00004550  # PE\0\0
 IMAGE_SIZEOF_SHORT_NAME = 8
-IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x00000080
 LZMA_PROPERTIES_SIZE = 5  # Standard LZMA properties size
-
-IMAGE_SCN_MEM_READ = 0x40000000
-IMAGE_SCN_MEM_WRITE = 0x80000000
-IMAGE_SCN_MEM_EXECUTE = 0x20000000
-IMAGE_SCN_CNT_CODE = 0x00000020
 
 IMAGE_ORDINAL_FLAG32 = 0x80000000
 IMAGE_ORDINAL_FLAG64 = 0x8000000000000000
@@ -35,21 +29,37 @@ KNOWN_PLAINTEXT = b'.dll\x00'
 
 _U32 = struct.Struct('<I')
 
+
+def get_memory_mapped_image(pe: lief.PE.Binary, raw_data: bytes) -> bytearray:
+    image = bytearray(pe.optional_header.sizeof_image)
+    n = min(pe.optional_header.sizeof_headers, len(raw_data))
+    image[:n] = raw_data[:n]
+    for section in pe.sections:
+        raw_size = section.sizeof_raw_data
+        if raw_size == 0:
+            continue
+        va = section.virtual_address
+        src_off = section.pointerto_raw_data
+        chunk = raw_data[src_off:src_off + raw_size]
+        image[va:va + len(chunk)] = chunk
+    return image
+
+
 def rol32(v, s): return ((v << (s & 0x1f)) | (v >> (-s & 0x1f))) & 0xFFFFFFFF
 def ror32(v, s): return ((v >> (s & 0x1f)) | (v << (-s & 0x1f))) & 0xFFFFFFFF
 
 
 class MappedRanges:
-    """Fast O(log n) membership test for mapped RVAs (pefile section ranges)."""
+    """Fast O(log n) membership test for mapped RVAs (section ranges)."""
 
     __slots__ = ('starts', 'ends', 'np_starts', 'np_ends')
 
-    def __init__(self, pe):
+    def __init__(self, pe: lief.PE.Binary):
         starts = []
         ends = []
         for s in pe.sections:
-            starts.append(s.VirtualAddress)
-            ends.append(s.VirtualAddress + max(s.Misc_VirtualSize, s.SizeOfRawData))
+            starts.append(s.virtual_address)
+            ends.append(s.virtual_address + max(s.virtual_size, s.sizeof_raw_data))
         self.starts = starts
         self.ends = ends
         self.np_starts = np.asarray(starts, dtype=np.uint32)
@@ -176,21 +186,23 @@ def to_hex_string(val, prefix=True):
     return f"0x{val:x}" if prefix else f"{val:x}"
 
 
-def find_vmp_section(pe) -> pefile.SectionStructure:
+def find_vmp_section(pe: lief.PE.Binary):
     for section in reversed(pe.sections):
-        if section.SizeOfRawData and section.PointerToRawData and \
-            section.IMAGE_SCN_MEM_EXECUTE and section.IMAGE_SCN_MEM_READ and not section.IMAGE_SCN_MEM_WRITE:
+        if section.sizeof_raw_data and section.pointerto_raw_data and \
+            section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE) and \
+            section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_READ) and \
+            not section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_WRITE):
             return section
     return None
 
 
-def scan_packer_info(pe):
+def scan_packer_info(pe: lief.PE.Binary, raw_data: bytes):
     '''
     VMProtect 3.10.5
     '''
-    packed_sections: list[pefile.SectionStructure] = []
+    packed_sections: list = []
     for s in pe.sections:
-        if s.SizeOfRawData == 0 and s.PointerToRawData == 0 and not s.IMAGE_SCN_CNT_UNINITIALIZED_DATA:
+        if s.sizeof_raw_data == 0 and s.pointerto_raw_data == 0 and not s.has_characteristic(lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA):
             packed_sections.append(s)
 
     if not packed_sections:
@@ -200,13 +212,13 @@ def scan_packer_info(pe):
     if not section:
         return
 
-    first_section_rva = packed_sections[0].VirtualAddress
+    first_section_rva = packed_sections[0].virtual_address
     n = len(packed_sections)
 
-    mm = pe.get_memory_mapped_image()
-    sec_start = section.VirtualAddress
-    sec_end = sec_start + max(section.Misc_VirtualSize, section.SizeOfRawData)
-    stop = sec_start + section.SizeOfRawData - 12
+    mm = get_memory_mapped_image(pe, raw_data)
+    sec_start = section.virtual_address
+    sec_end = sec_start + max(section.virtual_size, section.sizeof_raw_data)
+    stop = sec_start + section.sizeof_raw_data - 12
 
     candidates = []
     for align in range(4):
@@ -261,15 +273,15 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
     if not packed_pe_data:
         raise RuntimeError("Packed PE data is null or empty.")
     
-    # Use pefile library to parse PE file
+    # Use lief library to parse PE file
     try:
-        pe = pefile.PE(data=packed_pe_data)
-    except pefile.PEFormatError as e:
+        pe = lief.PE.parse(packed_pe_data)
+    except Exception as e:
         raise RuntimeError(f"Invalid PE file format: {str(e)}")
     
     # Get basic PE information
-    size_of_image = pe.OPTIONAL_HEADER.SizeOfImage
-    size_of_headers = pe.OPTIONAL_HEADER.SizeOfHeaders
+    size_of_image = pe.optional_header.sizeof_image
+    size_of_headers = pe.optional_header.sizeof_headers
     
     # Create unpacked image
     unpacked_image = bytearray(size_of_image)
@@ -280,7 +292,7 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
     # Find PACKER_INFO array
     packer_info_array = []
   
-    res = scan_packer_info(pe)
+    res = scan_packer_info(pe, packed_pe_data)
     if res is None:
         return b''
     packer_info_rva, packer_info_array = res
@@ -289,11 +301,11 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
     # Copy section data and update section headers in unpacked image
     for i, section in enumerate(pe.sections):
         # Original section header
-        virtual_address = section.VirtualAddress
-        virtual_size = section.Misc_VirtualSize
-        size_of_raw_data = section.SizeOfRawData
-        pointer_to_raw_data = section.PointerToRawData
-        section_name = section.Name.decode('ascii', errors='ignore').strip('\0')
+        virtual_address = section.virtual_address
+        virtual_size = section.virtual_size
+        size_of_raw_data = section.sizeof_raw_data
+        pointer_to_raw_data = section.pointerto_raw_data
+        section_name = section.name.rstrip('\0')
         
         # Copy section data
         if pointer_to_raw_data != 0 and size_of_raw_data > 0:
@@ -305,7 +317,8 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
                       f"RawSize={to_hex_string(size_of_raw_data)}, VA={to_hex_string(virtual_address)}. Skipping copy.")
         
         # Get section table offset in file
-        section_offset = pe.OPTIONAL_HEADER.get_file_offset() + pe.FILE_HEADER.SizeOfOptionalHeader + i * 40
+        nt_off = pe.dos_header.addressof_new_exeheader
+        section_offset = nt_off + 24 + pe.header.sizeof_optional_header + i * 40
         
         # Update section header in unpacked image
         unpacked_section_offset = section_offset
@@ -327,9 +340,11 @@ def unpack_pe(packed_pe_data: bytes) -> bytes:
                 compressed_data_rva = current_block_info.Src
                 uncompressed_target_rva = current_block_info.Dst
                 
-                # Use pefile to get file offset
+                # Use lief to get file offset
                 try:
-                    compressed_block_raw_offset = pe.get_offset_from_rva(compressed_data_rva)
+                    compressed_block_raw_offset = pe.rva_to_offset(compressed_data_rva)
+                    if compressed_block_raw_offset is None:
+                        raise ValueError(f'RVA {to_hex_string(compressed_data_rva)} not in any section')
                 except Exception as e:
                     raise RuntimeError(f"Block {block_idx}: Cannot convert RVA to file offset: {str(e)}")
                 
@@ -393,13 +408,13 @@ def derive_key_hints(image, known_plaintext, rva):
             return result
 
 
-def find_key(pe):
-    image = pe.get_memory_mapped_image()
+def find_key(pe: lief.PE.Binary, raw_data: bytes):
+    image = get_memory_mapped_image(pe, raw_data)
     mapped = MappedRanges(pe)
-    vmp_section: pefile.SectionStructure = find_vmp_section(pe)
+    vmp_section = find_vmp_section(pe)
 
-    sec_start = vmp_section.VirtualAddress
-    sec_size = max(vmp_section.Misc_VirtualSize, vmp_section.SizeOfRawData)
+    sec_start = vmp_section.virtual_address
+    sec_size = max(vmp_section.virtual_size, vmp_section.sizeof_raw_data)
     sec_end = min(sec_start + sec_size, len(image))
 
     code = image[sec_start:sec_end]
@@ -460,7 +475,7 @@ def parse_va_list(s):
     return [int(x, 0) for x in s.split(',') if x.strip()]
 
 
-def find_import_descriptors(pe, key):
+def find_import_descriptors(pe: lief.PE.Binary, key, raw_data: bytes):
     """Locate the VMP import-descriptor block.
 
     Returns ``(dll_info_rva, [(dll_name, [(api, slot_rva, key), ...]), ...])``
@@ -469,11 +484,11 @@ def find_import_descriptors(pe, key):
     vmp_section = find_vmp_section(pe)
     if vmp_section is None:
         return None, []
-    mm = pe.get_memory_mapped_image()
+    mm = get_memory_mapped_image(pe, raw_data)
     mapped = MappedRanges(pe)
-    sec_start = vmp_section.VirtualAddress
-    sec_end = min(sec_start + max(vmp_section.Misc_VirtualSize,
-                                  vmp_section.SizeOfRawData), len(mm))
+    sec_start = vmp_section.virtual_address
+    sec_end = min(sec_start + max(vmp_section.virtual_size,
+                                  vmp_section.sizeof_raw_data), len(mm))
     best_ea, best_count = None, 0
     for ea in find_descriptor_candidates(mm, mapped, sec_start, sec_end):
         count = count_valid_dll_descriptors(mm, mapped, ea)
@@ -494,7 +509,7 @@ def build_import_map(dlls):
     return result
 
 
-def build_fix_section(pe, dlls, sites):
+def build_fix_section(pe: lief.PE.Binary, dlls, sites):
     """Build the new section blob: import directory + fresh IAT + redirect stubs.
 
     The import table is emitted in the standard layout -- one descriptor per
@@ -505,7 +520,7 @@ def build_fix_section(pe, dlls, sites):
     Returns ``(blob, slot_va, stub_va, descriptors_rva, descriptors_size,
     iat_rva, iat_size)``.
     """
-    sec_va = pe.OPTIONAL_HEADER.SizeOfImage
+    sec_va = pe.optional_header.sizeof_image
     blob = bytearray()
 
     def alloc(data, align=8):
@@ -514,7 +529,7 @@ def build_fix_section(pe, dlls, sites):
         blob.extend(b'\0' * ((-len(blob)) % align))
         return sec_va + off
 
-    is_x64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+    is_x64 = pe.header.machine == lief.PE.Header.MACHINE_TYPES.AMD64
     if is_x64:
         align_size = 8
     else:
@@ -556,7 +571,7 @@ def build_fix_section(pe, dlls, sites):
         if is_x64:
             stub += struct.pack('<i', slot_va[slot] - (sec_va + len(blob) + 6))
         else:
-            stub += struct.pack('<i', slot_va[slot] + pe.OPTIONAL_HEADER.ImageBase)
+            stub += struct.pack('<i', slot_va[slot] + pe.optional_header.imagebase)
         stub_va[(api, slot)] = alloc(stub)
 
     name_rva = {}
@@ -595,50 +610,28 @@ def build_fix_section(pe, dlls, sites):
             20 * (len(dll_order) + 1), iat_start, iat_size)
 
 
-def add_section(data, pe, blob, name='idata', chars=0xC0000040):
-    """Append a new section header + raw data; return the rebuilt PE bytes.
+def add_section(pe: lief.PE.Binary, blob, name='idata', chars=0xC0000040):
+    """Append a new section using lief's PE API and return the section.
 
-    pefile is a parser and has no add-section API, and ``write()`` would
-    re-serialize the whole image (risky for a protected dump), so the new
-    IMAGE_SECTION_HEADER is spliced into the raw bytes directly.
+    The section is placed at ``SizeOfImage`` -- the same RVA base
+    ``build_fix_section`` uses for the import table -- and lief aligns
+    ``SizeOfRawData`` to the file alignment, lays the raw data out at the end
+    of the file and updates ``NumberOfSections``/``SizeOfImage`` when the
+    binary is serialized.
     """
-    out = bytearray(data)
-    nsec = pe.FILE_HEADER.NumberOfSections
-    va = pe.OPTIONAL_HEADER.SizeOfImage
-    fa = pe.OPTIONAL_HEADER.FileAlignment
-    sa = pe.OPTIONAL_HEADER.SectionAlignment
-    raw_off = len(data)
-    rsize = (len(blob) + fa - 1) // fa * fa
-
-    # Next free slot in the section header table: last header + 40 bytes.
-    hdr_off = pe.sections[-1].get_file_offset() + 40
-    if hdr_off + 40 > pe.OPTIONAL_HEADER.SizeOfHeaders:
-        raise SystemExit('no room in the section header table')
-    out[hdr_off: hdr_off + 40] = struct.pack(
-        '<8sIIIIIIHHI', name.encode(), len(blob), va, rsize, raw_off,
-        0, 0, 0, 0, chars)
-
-    # FILE_HEADER.NumberOfSections (after the 4-byte PE\\0\\0 signature)
-    # and OPTIONAL_HEADER.SizeOfImage (fixed at offset 56 in both PE32/PE32+).
-    # SizeOfImage must cover the whole new section's virtual extent, not just
-    # one SectionAlignment -- otherwise the appended import directory lands
-    # outside the image and is ignored by IDA/Windows.
-    nt_off = pe.NT_HEADERS.get_file_offset()
-    out[nt_off + 4 + 2: nt_off + 4 + 4] = struct.pack('<H', nsec + 1)
-    size_of_image = ((va + len(blob) + sa - 1) // sa) * sa
-    out[pe.OPTIONAL_HEADER.get_file_offset() + 56:
-        pe.OPTIONAL_HEADER.get_file_offset() + 60] = struct.pack('<I', size_of_image)
-
-    out.extend(blob)
-    out.extend(b'\0' * (rsize - len(blob)))
-    return bytes(out)
+    section = lief.PE.Section(name)
+    section.content = list(blob)
+    section.characteristics = chars
+    section.virtual_address = pe.optional_header.sizeof_image
+    pe.add_section(section)
+    return section
 
 
-def fix_imports(data, pe, key, code_rva, internal_stub_rvas=(),
+def fix_imports(data, pe: lief.PE.Binary, key, code_rva, internal_stub_rvas=(),
                 verbose=False):
     """Rebuild the import table, patch the call sites and write a fixed PE.
     """
-    dll_info, dlls = find_import_descriptors(pe, key)
+    dll_info, dlls = find_import_descriptors(pe, key, data)
     if dll_info is None:
         raise SystemExit('no import descriptors found')
     print(f'import descriptors at {dll_info:#x}, {len(dlls)} DLLs')
@@ -649,7 +642,7 @@ def fix_imports(data, pe, key, code_rva, internal_stub_rvas=(),
 
     import_map = build_import_map(dlls)
     code_section, code_rva = find_code_section(pe, code_rva)
-    sites = classify_sites(pe, import_map, code_section, code_rva,
+    sites = classify_sites(pe, data, import_map, code_section, code_rva,
                            internal_stub_rvas, verbose)
     if not sites:
         raise SystemExit('no import call sites classified')
@@ -657,50 +650,51 @@ def fix_imports(data, pe, key, code_rva, internal_stub_rvas=(),
 
     blob, slot_va, stub_va, desc_rva, desc_size, iat_rva, iat_size = \
         build_fix_section(pe, dlls, sites)
-    base = pe.OPTIONAL_HEADER.ImageBase
+    base = pe.optional_header.imagebase
 
     out = bytearray(data)
     for rva, kind, api, slot, size in sites:
         at = rva
         if size >= 6:
             opcode = b'\xFF\x15' if kind == 'CALL' else b'\xFF\x25'
-            if pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]:
+            if pe.header.machine == lief.PE.Header.MACHINE_TYPES.AMD64:
                 patch = opcode + struct.pack(
                     '<i', base + slot_va[slot] - (base + at + 6))
             else:
                 patch = opcode + struct.pack('<I', base + slot_va[slot])
-            out[pe.get_offset_from_rva(at):pe.get_offset_from_rva(at) + 6] = patch
+            out[pe.rva_to_offset(at):pe.rva_to_offset(at) + 6] = patch
         else:
             opcode = b'\xE8' if kind == 'CALL' else b'\xE9'
             patch = opcode + struct.pack(
                 '<i', base + stub_va[(api, slot)] - (base + at + 5))
-            out[pe.get_offset_from_rva(at):pe.get_offset_from_rva(at) + 5] = patch
+            out[pe.rva_to_offset(at):pe.rva_to_offset(at) + 5] = patch
 
-
-    out = bytearray(add_section(bytes(out), pe, blob, chars=0xE0000040))
-    dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[1].get_file_offset()
-    struct.pack_into('<II', out, dd, desc_rva, desc_size)
-    iat_dd = pe.OPTIONAL_HEADER.DATA_DIRECTORY[12].get_file_offset()
-    struct.pack_into('<II', out, iat_dd, iat_rva, iat_size)
+    pe = lief.PE.parse(bytes(out))
+    pe.remove_all_imports()
+    add_section(pe, blob, 'idata', chars=0xE0000040)
+    desc = pe.data_directory(lief.PE.DataDirectory.TYPES.IMPORT_TABLE)
+    desc.rva, desc.size = desc_rva, desc_size
+    iat = pe.data_directory(lief.PE.DataDirectory.TYPES.IAT)
+    iat.rva, iat.size = iat_rva, iat_size
 
     print(f'import dir rva={desc_rva:#x} '
           f'size={desc_size:#x} ({sum(len(a) for _, a in dlls)} imports)')
-    return bytes(out)
+    return bytes(pe.write_to_bytes())
 
 
-def find_code_section(pe, code_rva=None):
+def find_code_section(pe: lief.PE.Binary, code_rva=None):
     """Return (section, rva) of the code to scan.
 
     Defaults to the first executable code section; override with ``code_rva``.
     """
     if code_rva is not None:
-        section = pe.get_section_by_rva(code_rva)
+        section = pe.section_from_rva(code_rva)
         if section is not None:
             return section, code_rva
         raise SystemExit(f'no section contains rva {code_rva:#x}')
     for section in pe.sections:
-        if section.IMAGE_SCN_MEM_EXECUTE and section.IMAGE_SCN_CNT_CODE:
-            return section, section.VirtualAddress
+        if section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE) and section.has_characteristic(lief.PE.Section.CHARACTERISTICS.CNT_CODE):
+            return section, section.virtual_address
     raise SystemExit('no executable code section found')
 
 
@@ -716,31 +710,32 @@ def hook_mem_read(uc, access, address, size, value, userdata):
 
 
 class Emu:
-    def __init__(self, pe: pefile.PE, import_map=None, verbose=False):
+    def __init__(self, pe: lief.PE.Binary, raw_data, import_map=None, verbose=False):
         self.import_map = import_map or {}
         self.verbose = verbose
-        base = pe.OPTIONAL_HEADER.ImageBase
-        self.is_x64 = pe.FILE_HEADER.Machine == pefile.MACHINE_TYPE["IMAGE_FILE_MACHINE_AMD64"]
+        base = pe.optional_header.imagebase
+        self.is_x64 = pe.header.machine == lief.PE.Header.MACHINE_TYPES.AMD64
         if self.is_x64:
             uc = Uc(UC_ARCH_X86, UC_MODE_64)
         else:
             uc = Uc(UC_ARCH_X86, UC_MODE_32)
         for section in pe.sections:
-            if not section.SizeOfRawData:
+            if not section.sizeof_raw_data:
                 continue
-            data = pe.get_data(section.VirtualAddress, section.SizeOfRawData)
-            size = (section.SizeOfRawData + 0xFFF) & ~0xFFF
+            podata = raw_data[section.pointerto_raw_data:
+                              section.pointerto_raw_data + section.sizeof_raw_data]
+            size = (section.sizeof_raw_data + 0xFFF) & ~0xFFF
 
             prot = UC_PROT_NONE
-            if section.IMAGE_SCN_MEM_READ:
+            if section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_READ):
                 prot |= UC_PROT_READ
-            if section.IMAGE_SCN_MEM_WRITE:
+            if section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_WRITE):
                 prot |= UC_PROT_WRITE
-            if section.IMAGE_SCN_MEM_EXECUTE:
+            if section.has_characteristic(lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE):
                 prot |= UC_PROT_EXEC
 
-            uc.mem_map(base + section.VirtualAddress, size, prot)
-            uc.mem_write(base + section.VirtualAddress, data)
+            uc.mem_map(base + section.virtual_address, size, prot)
+            uc.mem_write(base + section.virtual_address, podata)
 
         self.read_record_list = []
         self.stack_address = 0x100000
@@ -751,7 +746,7 @@ class Emu:
         uc.reg_write(self.stack_reg, self.stack_init)
         # uc.hook_add(UC_HOOK_CODE, hook_code, self)
         uc.hook_add(UC_HOOK_MEM_READ, hook_mem_read, self,
-                    base, base + pe.OPTIONAL_HEADER.SizeOfImage)
+                    base, base + pe.optional_header.sizeof_image)
         self.uc_context = uc.context_save()
         
         self.pe = pe
@@ -764,7 +759,7 @@ class Emu:
         self.uc.mem_write(self.stack_address, b'\0' * self.stack_size)
 
     def resolve_import(self, address):
-        info = self.import_map.get(address - self.pe.OPTIONAL_HEADER.ImageBase)
+        info = self.import_map.get(address - self.pe.optional_header.imagebase)
         return info if info else '?'
 
     def run(self, address):
@@ -851,11 +846,11 @@ class Emu:
                 self.last['reason'] = (f'no return address, '
                                     f'delta_rsp={delta_rsp:#x}')
                 return
-        self.last['slot'] = read_addr - self.pe.OPTIONAL_HEADER.ImageBase
+        self.last['slot'] = read_addr - self.pe.optional_header.imagebase
         return address, kind, target, size
 
 
-def classify_sites(pe, import_map, code_section, code_rva, internal_stub_rvas=(),
+def classify_sites(pe: lief.PE.Binary, raw_data, import_map, code_section, code_rva, internal_stub_rvas=(),
                    verbose=False):
     """Classify cross-section E8 call sites and direct IAT indirection stubs.
 
@@ -875,10 +870,11 @@ def classify_sites(pe, import_map, code_section, code_rva, internal_stub_rvas=()
       (``key == 0``), e.g. ``memcpy``, so they must be repointed to the fresh
       IAT as well.
     """
-    base = pe.OPTIONAL_HEADER.ImageBase
-    code = pe.get_data(code_section.VirtualAddress, code_section.SizeOfRawData)
+    base = pe.optional_header.imagebase
+    code = raw_data[code_section.pointerto_raw_data:
+                    code_section.pointerto_raw_data + code_section.sizeof_raw_data]
     internal = set(internal_stub_rvas)
-    emu = Emu(pe, import_map, verbose)
+    emu = Emu(pe, raw_data, import_map, verbose)
     sites = []
     i = code.find(b'\xe8')
     while i != -1:
@@ -888,15 +884,23 @@ def classify_sites(pe, import_map, code_section, code_rva, internal_stub_rvas=()
         except struct.error:
             i = code.find(b'\xe8', i + 1)
             continue
-        dst_section = pe.get_section_by_rva(dst)
-        cross_section = (dst_section and dst_section != code_section and
-                         (dst_section.Characteristics & IMAGE_SCN_MEM_EXECUTE))
-        internal_stub = dst_section == code_section and dst in internal
+        if dst > 0:
+            dst_section = pe.section_from_rva(dst)
+        else:
+            dst_section = None
+        if dst_section is not None:
+            is_code = dst_section.virtual_address == code_section.virtual_address
+            cross_section = (not is_code and dst_section.has_characteristic(
+                lief.PE.Section.CHARACTERISTICS.MEM_EXECUTE))
+            internal_stub = is_code and dst in internal
+        else:
+            cross_section = False
+            internal_stub = False
         if not (cross_section or internal_stub):
             i = code.find(b'\xe8', i + 1)
             continue
         if verbose:
-            loc = dst_section.Name.decode('latin-1', 'ignore') if dst_section else '?'
+            loc = dst_section.name if dst_section else '?'
             print(f'[site] {base + rva:#x}: E8 -> {base + dst:#x} '
                   f'({loc}, {"internal" if internal_stub else "cross"})')
         result = emu.run(base + rva)
@@ -969,9 +973,9 @@ def main():
             print(f"Unpacked data written to: {unpacked_filepath}")
 
         print("Fixing imports...")
-        pe = pefile.PE(data=unpacked_data, fast_load=True)
-        base = pe.OPTIONAL_HEADER.ImageBase
-        key = args.key if args.key else find_key(pe)
+        pe = lief.PE.parse(unpacked_data)
+        base = pe.optional_header.imagebase
+        key = args.key if args.key else find_key(pe, unpacked_data)
         print('key:', hex(key))
         if not key:
             return 0
