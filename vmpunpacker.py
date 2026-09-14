@@ -24,8 +24,21 @@ IMAGE_ORDINAL_FLAG32 = 0x80000000
 IMAGE_ORDINAL_FLAG64 = 0x8000000000000000
 IMPORT_ENTRY_SIZE = 12
 
+# ELF file format constants
+ELF_MAGIC = b'\x7fELF'
+ELF_CLASS32 = 1
+ELF_CLASS64 = 2
+PT_LOAD = 1
+ELF32_PHDR_FMT = '<IIIIIIII'  # type, offset, vaddr, paddr, filesz, memsz, flags, align
+ELF64_PHDR_FMT = '<IIQQQQQQ'  # type, flags, offset, vaddr, paddr, filesz, memsz, align
+ELF32_PHDR_SIZE = 32
+ELF64_PHDR_SIZE = 56
+ELF32_PHOFF_OFF, ELF32_PHENTSIZE_OFF, ELF32_PHNUM_OFF = 0x1C, 0x2A, 0x2C
+ELF64_PHOFF_OFF, ELF64_PHENTSIZE_OFF, ELF64_PHNUM_OFF = 0x20, 0x36, 0x38
+
 # exe sys ?
 KNOWN_PLAINTEXT = b'.dll\x00'
+LZMA_PROPS_DATA = bytes.fromhex('5d 00 00 00 01')
 
 _U32 = struct.Struct('<I')
 
@@ -181,6 +194,18 @@ class PACKER_INFO:
     Src: int  # uint32
     Dst: int  # uint32
 
+
+@dataclass
+class Region:
+    """A contiguous memory region (section or segment) of a binary.
+
+    ``start``/``end`` use the format's native addressing (RVA for PE,
+    virtual address for ELF); ``raw_size`` is the on-disk size when relevant.
+    """
+    start: int
+    end: int
+    raw_size: int = 0
+
 def to_hex_string(val, prefix=True):
     """Convert value to hexadecimal string for better error message display"""
     return f"0x{val:x}" if prefix else f"{val:x}"
@@ -196,189 +221,423 @@ def find_vmp_section(pe: lief.PE.Binary):
     return None
 
 
-def scan_packer_info(pe: lief.PE.Binary, raw_data: bytes):
-    '''
-    VMProtect 3.10.5
-    '''
-    packed_sections: list = []
-    for s in pe.sections:
-        if s.sizeof_raw_data == 0 and s.pointerto_raw_data == 0 and not s.has_characteristic(lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA):
-            packed_sections.append(s)
+def scan_packer_info_candidates(image, scan_lo, scan_hi, val_lo, val_hi, n):
+    """Yield candidate ``info_base`` offsets of a PACKER_INFO array.
 
-    if not packed_sections:
-        return
-    
-    section = find_vmp_section(pe)
-    if not section:
-        return
+    A candidate is an image offset where the ``Src`` words -- read as u32 at
+    ``info_base``, ``info_base + 8``, ... ``info_base + 8 * (n - 1)`` -- all
+    fall within ``[val_lo, val_hi)``. Every byte offset in ``[scan_lo,
+    scan_hi)`` is checked (vectorised with numpy over the four byte residues).
 
-    first_section_rva = packed_sections[0].virtual_address
-    n = len(packed_sections)
-
-    mm = get_memory_mapped_image(pe, raw_data)
-    sec_start = section.virtual_address
-    sec_end = sec_start + max(section.virtual_size, section.sizeof_raw_data)
-    stop = sec_start + section.sizeof_raw_data - 12
-
+    ``scan_lo``/``scan_hi``/``info_base`` are image offsets while
+    ``val_lo``/``val_hi`` are compared against the raw u32 values, so the
+    caller controls the address space of each.
+    """
     candidates = []
     for align in range(4):
-        base = sec_start + ((align - sec_start) & 3)
-        if base >= stop:
+        base = scan_lo + ((align - scan_lo) & 3)
+        if base >= scan_hi:
             continue
-        total = (len(mm) - base) // 4
+        total = (len(image) - base) // 4
         if total <= 2 * (n - 1):
             continue
-        need = min(total - 2 * (n - 1), (stop - 1 - base) // 4 + 1)
+        need = min(total - 2 * (n - 1), (scan_hi - 1 - base) // 4 + 1)
         if need <= 0:
             continue
-        arr = np.ndarray(shape=(need + 2 * (n - 1),), dtype='<u4', buffer=mm, offset=base, strides=(4,))
-        ok = (arr[:need] >= sec_start) & (arr[:need] < sec_end)
+        arr = np.ndarray(shape=(need + 2 * (n - 1),), dtype='<u4',
+                         buffer=image, offset=base, strides=(4,))
+        ok = (arr[:need] >= val_lo) & (arr[:need] < val_hi)
         for i in range(1, n):
-            ok &= (arr[2 * i:2 * i + need] >= sec_start) & (arr[2 * i:2 * i + need] < sec_end)
+            ok &= (arr[2 * i:2 * i + need] >= val_lo) & \
+                  (arr[2 * i:2 * i + need] < val_hi)
         for j in np.nonzero(ok)[0]:
             candidates.append(base + 4 * int(j))
-
     candidates.sort()
-    for info_base in candidates:
-        key = _U32.unpack_from(mm, info_base + 4)[0]
-        key ^= first_section_rva
-        key = ror32(key, 7)
-        start_key = key
-        packer_info = []
-        valid = True
-        for i in range(n):
-            key = rol32(key, 7)
-            src = _U32.unpack_from(mm, info_base + i * 2 * 4)[0]
-            dst = _U32.unpack_from(mm, info_base + (i * 2 + 1) * 4)[0]
-            dst ^= key
-            if dst & 0xFFF:
-                valid = False
-                break
-            packer_info.append(PACKER_INFO(src, dst))
-        if valid:
-            print('key:', hex(start_key))
-            return info_base, packer_info
+    return candidates
+
+
+def decode_packer_info(image, info_base, n, key_seed, validate):
+    """Decode a PACKER_INFO array at ``info_base``.
+
+    Derives the start key from the stored ``Dst`` word and the format key seed
+    (``xor seed -> ror32 7``), then walks ``n`` entries applying ``rol32 7``
+    and ``dst ^= key``. ``validate(image, src, dst, i)`` applies the
+    format-specific sanity check; returns ``None`` if any entry is invalid.
+    """
+    key = _U32.unpack_from(image, info_base + 4)[0]
+    key ^= key_seed
+    key = ror32(key, 7)
+    key_base = key
+    entries = []
+    for i in range(n):
+        key = rol32(key, 7)
+        src = _U32.unpack_from(image, info_base + i * 8)[0]
+        dst = _U32.unpack_from(image, info_base + i * 8 + 4)[0]
+        dst ^= key
+        if not validate(image, src, dst, i):
+            return None
+        entries.append(PACKER_INFO(src, dst))
+    return key_base, entries
+
+
+def decompress_blocks(image, source, entries, backend, props=None):
+    """LZMA-decompress every PACKER_INFO block into ``image``.
+
+    ``source`` is a pristine copy of the memory image (compressed blocks are
+    read from it so writes to ``image`` cannot corrupt later blocks);
+    ``backend`` supplies ``read_compressed(Src)`` and ``target_offset(Dst)``.
+    """
+    if not entries or len(entries) <= 1:
+        return
+    props = LZMA_PROPS_DATA if props is None else props
+    try:
+        for block_idx, info in enumerate(entries):
+            compressed_data = backend.read_compressed(info.Src, source)
+            target = backend.target_offset(info.Dst)
+            if target >= len(image):
+                raise RuntimeError(
+                    f"Block {block_idx}: PACKER_INFO.Dst (decompression target "
+                    f"{to_hex_string(info.Dst)}) exceeds image boundary "
+                    f"({to_hex_string(len(image))}).")
+
+            decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
+            try:
+                decompressed_data = decompressor.decompress(
+                    props + b'\xFF' * 8 + compressed_data)
+            except lzma.LZMAError as e:
+                raise RuntimeError(f"LZMA decompression error: {str(e)}")
+
+            available_space = len(image) - target
+            if len(decompressed_data) <= available_space:
+                image[target:target + len(decompressed_data)] = decompressed_data
+            else:
+                print(f"Warning: Block {block_idx}: Decompressed data size "
+                      f"exceeds available space in image")
+                image[target:target + available_space] = \
+                    decompressed_data[:available_space]
+            print(f"Block {block_idx}: Decompressed. Output size={len(decompressed_data)}")
+    except Exception as e:
+        raise RuntimeError(f"Error processing LZMA data: {str(e)}")
+
+
+class FormatBackend:
+    """Format-specific hooks for the shared unpack pipeline."""
+
+    kind = '?'
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.binary = self.parse(data)
+        self.image_base = 0
+
+    def parse(self, data):
+        raise NotImplementedError
+
+    def build_image(self):
+        """Return the (mutable) memory-mapped image; set ``image_base``."""
+        raise NotImplementedError
+
+    def find_vmp_region(self):
+        """Return the ``Region`` holding the VMP stub, or ``None``."""
+        raise NotImplementedError
+
+    def reserved_regions(self):
+        """Return the regions VMProtect reserved for unpacked data."""
+        raise NotImplementedError
+
+    def region_count(self, reserved):
+        return len(reserved)
+
+    def key_seed(self, reserved):
+        raise NotImplementedError
+
+    def scan_bounds(self, region):
+        """Return ``(scan_lo, scan_hi, val_lo, val_hi)`` for the scan."""
+        raise NotImplementedError
+
+    def validate_entry(self, image, src, dst, i):
+        raise NotImplementedError
+
+    def read_compressed(self, src, source):
+        raise NotImplementedError
+
+    def target_offset(self, dst):
+        raise NotImplementedError
+
+    def normalize_headers(self, image):
+        raise NotImplementedError
+
+
+def get_memory_mapped_elf_image(elf: lief.ELF.Binary):
+    """Build a memory image from PT_LOAD segments; returns (image, min_vaddr)."""
+    load_segments = [seg for seg in elf.segments
+                     if seg.type == lief.ELF.Segment.TYPE.LOAD]
+    if not load_segments:
+        load_segments = [seg for seg in elf.segments if seg.type.value == PT_LOAD]
+    if not load_segments:
+        raise ValueError("No PT_LOAD segments found")
+
+    min_vaddr = min(seg.virtual_address for seg in load_segments)
+    max_vaddr_end = max(seg.virtual_address + seg.virtual_size
+                        for seg in load_segments)
+    image = bytearray(max_vaddr_end - min_vaddr)
+    for seg in load_segments:
+        offset = seg.virtual_address - min_vaddr
+        content = bytes(seg.content)
+        image[offset:offset + len(content)] = content
+    return image, min_vaddr
+
+
+class PEFileBackend(FormatBackend):
+    kind = 'PE'
+
+    def parse(self, data):
+        try:
+            return lief.PE.parse(data)
+        except Exception as e:
+            raise RuntimeError(f"Invalid PE file format: {str(e)}")
+
+    def build_image(self):
+        return get_memory_mapped_image(self.binary, self.data)
+
+    def find_vmp_region(self):
+        section = find_vmp_section(self.binary)
+        if section is None:
+            return None
+        return Region(section.virtual_address,
+                      section.virtual_address + max(section.virtual_size,
+                                                    section.sizeof_raw_data),
+                      section.sizeof_raw_data)
+
+    def reserved_regions(self):
+        regions = []
+        for s in self.binary.sections:
+            if s.sizeof_raw_data == 0 and s.pointerto_raw_data == 0 and \
+                    not s.has_characteristic(
+                        lief.PE.Section.CHARACTERISTICS.CNT_UNINITIALIZED_DATA):
+                regions.append(Region(
+                    s.virtual_address,
+                    s.virtual_address + max(s.virtual_size, s.sizeof_raw_data)))
+        return regions
+
+    def key_seed(self, reserved):
+        return reserved[0].start
+
+    def scan_bounds(self, region):
+        return (region.start, region.start + region.raw_size - 12,
+                region.start, region.end)
+
+    def validate_entry(self, image, src, dst, i):
+        return (dst & 0xFFF) == 0
+
+    def read_compressed(self, src, source):
+        offset = self.binary.rva_to_offset(src)
+        if offset is None:
+            raise ValueError(f'RVA {to_hex_string(src)} not in any section')
+        return self.data[offset:]
+
+    def target_offset(self, dst):
+        return dst
+
+    def normalize_headers(self, image):
+        pe = self.binary
+        size_of_image = len(image)
+        for i, section in enumerate(pe.sections):
+            virtual_address = section.virtual_address
+            virtual_size = section.virtual_size
+            size_of_raw_data = section.sizeof_raw_data
+            pointer_to_raw_data = section.pointerto_raw_data
+            section_name = section.name.rstrip('\0')
+
+            if pointer_to_raw_data != 0 and size_of_raw_data > 0:
+                if pointer_to_raw_data + size_of_raw_data <= len(self.data) and \
+                        virtual_address + size_of_raw_data <= size_of_image:
+                    image[virtual_address:virtual_address + size_of_raw_data] = \
+                        self.data[pointer_to_raw_data:
+                                  pointer_to_raw_data + size_of_raw_data]
+                else:
+                    print(f"Warning: Section {section_name} data exceeds boundaries. "
+                          f"RawOffset={to_hex_string(pointer_to_raw_data)}, "
+                          f"RawSize={to_hex_string(size_of_raw_data)}, "
+                          f"VA={to_hex_string(virtual_address)}. Skipping copy.")
+
+            nt_off = pe.dos_header.addressof_new_exeheader
+            section_offset = nt_off + 24 + pe.header.sizeof_optional_header + i * 40
+            struct.pack_into("<I", image, section_offset + 20, virtual_address)
+            if virtual_size > 0:
+                struct.pack_into("<I", image, section_offset + 16, virtual_size)
+
+
+class ELFBackend(FormatBackend):
+    kind = 'ELF'
+
+    def parse(self, data):
+        try:
+            return lief.ELF.parse(data)
+        except Exception as e:
+            raise RuntimeError(f"Invalid ELF file format: {str(e)}")
+
+    def build_image(self):
+        image, min_vaddr = get_memory_mapped_elf_image(self.binary)
+        self.image_base = min_vaddr
+        return image
+
+    def _load_segments(self):
+        return [seg for seg in self.binary.segments
+                if seg.type == lief.ELF.Segment.TYPE.LOAD]
+
+    def find_vmp_region(self):
+        for segment in self._load_segments():
+            if (segment.physical_size == segment.virtual_size and
+                    segment.file_offset < 0x1000 and
+                    (segment.flags & (lief.ELF.Segment.FLAGS.R |
+                                      lief.ELF.Segment.FLAGS.X))):
+                return Region(segment.virtual_address,
+                              segment.virtual_address + segment.virtual_size)
+        return None
+
+    def reserved_regions(self):
+        regions = []
+        for segment in self._load_segments():
+            if (segment.physical_address != 0 and
+                    segment.physical_size == 0 and
+                    segment.virtual_size > 0x1000):
+                regions.append(Region(
+                    segment.virtual_address,
+                    segment.virtual_address + segment.virtual_size))
+        return regions
+
+    def region_count(self, reserved):
+        return len(reserved) + 1
+
+    def key_seed(self, reserved):
+        first_load = self._load_segments()[0]
+        return first_load.virtual_address + first_load.physical_size
+
+    def scan_bounds(self, region):
+        scan_lo = region.start - self.image_base
+        return (scan_lo, scan_lo + (region.end - region.start),
+                region.start, region.end)
+
+    def validate_entry(self, image, src, dst, i):
+        offset = src - self.image_base
+        if not (0 <= offset < len(image)):
+            return False
+        return image[offset] == 0
+
+    def read_compressed(self, src, source):
+        return source[src - self.image_base:]
+
+    def target_offset(self, dst):
+        return dst - self.image_base
+
+    def normalize_headers(self, image):
+        is64 = self.data[4] == ELF_CLASS64
+        if is64:
+            phoff = struct.unpack_from('<Q', image, ELF64_PHOFF_OFF)[0]
+            phentsize = struct.unpack_from('<H', image, ELF64_PHENTSIZE_OFF)[0]
+            phnum = struct.unpack_from('<H', image, ELF64_PHNUM_OFF)[0]
+            fmt = ELF64_PHDR_FMT
+        else:
+            phoff = struct.unpack_from('<I', image, ELF32_PHOFF_OFF)[0]
+            phentsize = struct.unpack_from('<H', image, ELF32_PHENTSIZE_OFF)[0]
+            phnum = struct.unpack_from('<H', image, ELF32_PHNUM_OFF)[0]
+            fmt = ELF32_PHDR_FMT
+
+        load_type = lief.ELF.Segment.TYPE.LOAD.value
+        for i in range(phnum):
+            base = phoff + i * phentsize
+            if is64:
+                type_, flags, offset, vaddr, paddr, filesz, memsz, align = \
+                    struct.unpack_from(fmt, image, base)
+                if type_ == load_type:
+                    offset = vaddr - self.image_base
+                    filesz = memsz
+                struct.pack_into(fmt, image, base, type_, flags, offset, vaddr,
+                                 paddr, filesz, memsz, align)
+            else:
+                type_, offset, vaddr, paddr, filesz, memsz, flags, align = \
+                    struct.unpack_from(fmt, image, base)
+                if type_ == load_type:
+                    offset = vaddr - self.image_base
+                    filesz = memsz
+                struct.pack_into(fmt, image, base, type_, offset, vaddr, paddr,
+                                 filesz, memsz, flags, align)
+
+
+def unpack_image(backend: FormatBackend) -> bytes:
+    """Run the shared PE/ELF unpack pipeline for ``backend``."""
+    image = backend.build_image()
+    if not image:
+        return b''
+
+    region = backend.find_vmp_region()
+    if region is None:
+        return b''
+
+    reserved = backend.reserved_regions()
+    if not reserved:
+        return b''
+
+    n = backend.region_count(reserved)
+    key_seed = backend.key_seed(reserved)
+    scan_lo, scan_hi, val_lo, val_hi = backend.scan_bounds(region)
+    source = bytes(image)
+
+    entries = None
+    for info_base in scan_packer_info_candidates(
+            image, scan_lo, scan_hi, val_lo, val_hi, n):
+        result = decode_packer_info(image, info_base, n, key_seed,
+                                    backend.validate_entry)
+        if result is not None:
+            key_base, entries = result
+            print('key:', hex(key_base))
+            break
+    if entries is None:
+        return b''
+
+    backend.normalize_headers(image)
+    decompress_blocks(image, source, entries, backend)
+    return bytes(image)
 
 
 def unpack_pe(packed_pe_data: bytes) -> bytes:
     """
     Unpack a VMProtect protected PE file
-    
+
     Args:
         packed_pe_data: Byte content of the packed PE file
-        
+
     Returns:
         Unpacked PE file byte content
     """
     if not packed_pe_data:
         raise RuntimeError("Packed PE data is null or empty.")
-    
-    # Use lief library to parse PE file
-    try:
-        pe = lief.PE.parse(packed_pe_data)
-    except Exception as e:
-        raise RuntimeError(f"Invalid PE file format: {str(e)}")
-    
-    # Get basic PE information
-    size_of_image = pe.optional_header.sizeof_image
-    size_of_headers = pe.optional_header.sizeof_headers
-    
-    # Create unpacked image
-    unpacked_image = bytearray(size_of_image)
-    
-    # Copy PE headers
-    unpacked_image[:size_of_headers] = packed_pe_data[:size_of_headers]
-    
-    # Find PACKER_INFO array
-    packer_info_array = []
-  
-    res = scan_packer_info(pe, packed_pe_data)
-    if res is None:
-        return b''
-    packer_info_rva, packer_info_array = res
-    lzma_props_data = bytes.fromhex('5d 00 00 00 01')
+    return unpack_image(PEFileBackend(packed_pe_data))
 
-    # Copy section data and update section headers in unpacked image
-    for i, section in enumerate(pe.sections):
-        # Original section header
-        virtual_address = section.virtual_address
-        virtual_size = section.virtual_size
-        size_of_raw_data = section.sizeof_raw_data
-        pointer_to_raw_data = section.pointerto_raw_data
-        section_name = section.name.rstrip('\0')
-        
-        # Copy section data
-        if pointer_to_raw_data != 0 and size_of_raw_data > 0:
-            if pointer_to_raw_data + size_of_raw_data <= len(packed_pe_data) and virtual_address + size_of_raw_data <= size_of_image:
-                section_data = packed_pe_data[pointer_to_raw_data:pointer_to_raw_data+size_of_raw_data]
-                unpacked_image[virtual_address:virtual_address+len(section_data)] = section_data
-            else:
-                print(f"Warning: Section {section_name} data exceeds boundaries. RawOffset={to_hex_string(pointer_to_raw_data)}, "
-                      f"RawSize={to_hex_string(size_of_raw_data)}, VA={to_hex_string(virtual_address)}. Skipping copy.")
-        
-        # Get section table offset in file
-        nt_off = pe.dos_header.addressof_new_exeheader
-        section_offset = nt_off + 24 + pe.header.sizeof_optional_header + i * 40
-        
-        # Update section header in unpacked image
-        unpacked_section_offset = section_offset
-        
-        # Update PointerToRawData to VirtualAddress
-        struct.pack_into("<I", unpacked_image, unpacked_section_offset+20, virtual_address)
-        
-        # If VirtualSize is non-zero, use it as SizeOfRawData
-        if virtual_size > 0:
-            struct.pack_into("<I", unpacked_image, unpacked_section_offset+16, virtual_size)
-    
-    # Handle LZMA decompression
-    if packer_info_array and len(packer_info_array) > 1:
-        try:
-            # Process each LZMA block
-            for block_idx in range(len(packer_info_array)):
-                current_block_info = packer_info_array[block_idx]
-                
-                compressed_data_rva = current_block_info.Src
-                uncompressed_target_rva = current_block_info.Dst
-                
-                # Use lief to get file offset
-                try:
-                    compressed_block_raw_offset = pe.rva_to_offset(compressed_data_rva)
-                    if compressed_block_raw_offset is None:
-                        raise ValueError(f'RVA {to_hex_string(compressed_data_rva)} not in any section')
-                except Exception as e:
-                    raise RuntimeError(f"Block {block_idx}: Cannot convert RVA to file offset: {str(e)}")
-                
-                compressed_data = packed_pe_data[compressed_block_raw_offset:]
-                
-                if uncompressed_target_rva >= size_of_image:
-                    raise RuntimeError(f"Block {block_idx}: PACKER_INFO.Dst (decompression target RVA {to_hex_string(uncompressed_target_rva)}) "
-                                      f"exceeds image boundary ({to_hex_string(size_of_image)}).")
-                
-                # Create an LZMA decompressor
-                decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE)
-                
-                # Decompress data
-                try:
-                    decompressed_data = decompressor.decompress(lzma_props_data+b'\xFF'*8+compressed_data)
-                    
-                    # Write decompressed data to target location
-                    available_space = size_of_image - uncompressed_target_rva
-                    if len(decompressed_data) <= available_space:
-                        unpacked_image[uncompressed_target_rva:uncompressed_target_rva+len(decompressed_data)] = decompressed_data
-                    else:
-                        print(f"Warning: Block {block_idx}: Decompressed data size exceeds available space in image")
-                        # Only write data that can fit
-                        unpacked_image[uncompressed_target_rva:uncompressed_target_rva+available_space] = decompressed_data[:available_space]
-                    
-                    print(f"Block {block_idx}: Decompressed. Output size={len(decompressed_data)}")
-                
-                except lzma.LZMAError as e:
-                    raise RuntimeError(f"LZMA decompression error: {str(e)}")
-        
-        except Exception as e:
-            raise RuntimeError(f"Error processing LZMA data: {str(e)}")
-    
-    return bytes(unpacked_image)
+
+def unpack_elf(packed_elf_data: bytes) -> bytes:
+    """
+    Unpack a VMProtect protected ELF file
+
+    Args:
+        packed_elf_data: Byte content of the packed ELF file
+
+    Returns:
+        Unpacked ELF file byte content (memory image)
+    """
+    if not packed_elf_data:
+        raise RuntimeError("Packed ELF data is null or empty.")
+    return unpack_image(ELFBackend(packed_elf_data))
+
+
+def detect_backend(data: bytes) -> FormatBackend:
+    """Pick a backend from the file magic (PE 'MZ' or ELF)."""
+    if data[:2] == b'MZ':
+        return PEFileBackend(data)
+    if data[:4] == ELF_MAGIC:
+        return ELFBackend(data)
+    raise RuntimeError("Unsupported file format: expected PE (MZ) or ELF")
 
 
 def derive_key_hints_at_offset(image, known_plaintext, rva, offset=0):
@@ -930,11 +1189,12 @@ def classify_sites(pe: lief.PE.Binary, raw_data, import_map, code_section, code_
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('file', help='path to the VMProtect-protected PE file')
+    parser.add_argument('file', help='path to the VMProtect-protected PE/ELF file')
     parser.add_argument('-k', '--key', type=lambda s: int(s, 0), default=0,
-                        help='string decryption key (default: 0)')
+                        help='string decryption key (default: 0, PE only)')
     parser.add_argument('--code-rva', type=lambda s: int(s, 0), default=None,
-                        help='code section RVA to scan (default: first executable code section)')
+                        help='code section RVA to scan (default: first executable '
+                             'code section, PE only)')
     parser.add_argument('--internal-stubs', type=parse_va_list, default=[],
                         metavar='ADDR',
                         help='comma-separated address(es) of import stubs '
@@ -943,7 +1203,7 @@ def main():
                              'emulated too. Each entry may be an image-base VA '
                              'or an RVA; values >= image base are treated as '
                              'VAs, smaller ones as RVAs '
-                             '(e.g. --internal-stubs=0x140001AB4,0x1AB4)')
+                             '(e.g. --internal-stubs=0x140001AB4,0x1AB4, PE only)')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='print per-site emulation diagnostics '
                              '(stop reason, memory reads, classification)')
@@ -958,9 +1218,12 @@ def main():
         
         print(f"Packed file loaded: {packed_filepath}, size: {len(packed_data)} bytes")
         
-        # Perform unpacking
+        # Detect the container format and run the matching unpack pipeline
+        backend = detect_backend(packed_data)
+        print(f"Format: {backend.kind}")
+
         print("Unpacking...")
-        unpacked_data = unpack_pe(packed_data)
+        unpacked_data = unpack_image(backend)
         if not unpacked_data:
             print("Unpacking function failed or produced empty output.")
             unpacked_data = packed_data
@@ -971,6 +1234,10 @@ def main():
             with open(unpacked_filepath, 'wb') as f:
                 f.write(unpacked_data)
             print(f"Unpacked data written to: {unpacked_filepath}")
+
+        # Import rebuilding is currently only implemented for PE files.
+        if backend.kind != 'PE':
+            return 0
 
         print("Fixing imports...")
         pe = lief.PE.parse(unpacked_data)
