@@ -36,6 +36,31 @@ ELF64_PHDR_SIZE = 56
 ELF32_PHOFF_OFF, ELF32_PHENTSIZE_OFF, ELF32_PHNUM_OFF = 0x1C, 0x2A, 0x2C
 ELF64_PHOFF_OFF, ELF64_PHENTSIZE_OFF, ELF64_PHNUM_OFF = 0x20, 0x36, 0x38
 
+# Mach-O file format constants
+MH_MAGIC = 0xFEEDFACE
+MH_MAGIC_64 = 0xFEEDFACF
+FAT_MAGIC = 0xCAFEBABE
+FAT_MAGIC_64 = 0xCAFEBABF
+LC_SEGMENT = 0x1
+LC_SEGMENT_64 = 0x19
+LC_CODE_SIGNATURE = 0x1D
+MACHO_LINKEDIT_DATA_COMMANDS = frozenset({
+    LC_CODE_SIGNATURE,        # LC_CODE_SIGNATURE
+    0x1E,                     # LC_SEGMENT_SPLIT_INFO
+    0x26,                     # LC_FUNCTION_STARTS
+    0x29,                     # LC_DATA_IN_CODE
+    0x2B,                     # LC_DYLIB_CODE_SIGN_DRS
+    0x2E,                     # LC_LINKER_OPTIMIZATION_HINT
+    0x80000033,               # LC_DYLD_EXPORTS_TRIE
+    0x80000034,               # LC_DYLD_CHAINED_FIXUPS
+})
+MH_HEADER32_SIZE = 28
+MH_HEADER64_SIZE = 32
+MH_MAGIC_LE = struct.pack('<I', MH_MAGIC)
+MH_MAGIC_64_LE = struct.pack('<I', MH_MAGIC_64)
+FAT_MAGIC_BE = struct.pack('>I', FAT_MAGIC)
+FAT_MAGIC_64_BE = struct.pack('>I', FAT_MAGIC_64)
+
 # exe sys ?
 KNOWN_PLAINTEXT = b'.dll\x00'
 LZMA_PROPS_DATA = bytes.fromhex('5d 00 00 00 01')
@@ -222,7 +247,7 @@ def find_vmp_section(pe: lief.PE.Binary):
 
 
 def scan_packer_info_candidates(image, scan_lo, scan_hi, val_lo, val_hi, n):
-    """Yield candidate ``info_base`` offsets of a PACKER_INFO array.
+    """Return candidate ``info_base`` offsets of a PACKER_INFO array.
 
     A candidate is an image offset where the ``Src`` words -- read as u32 at
     ``info_base``, ``info_base + 8``, ... ``info_base + 8 * (n - 1)`` -- all
@@ -256,13 +281,15 @@ def scan_packer_info_candidates(image, scan_lo, scan_hi, val_lo, val_hi, n):
     return candidates
 
 
-def decode_packer_info(image, info_base, n, key_seed, validate):
+def decode_packer_info(image, info_base, n, key_seed, validate, adjust=None):
     """Decode a PACKER_INFO array at ``info_base``.
 
     Derives the start key from the stored ``Dst`` word and the format key seed
     (``xor seed -> ror32 7``), then walks ``n`` entries applying ``rol32 7``
     and ``dst ^= key``. ``validate(image, src, dst, i)`` applies the
     format-specific sanity check; returns ``None`` if any entry is invalid.
+    ``adjust`` maps a raw stored word to the format's native address (identity
+    when omitted).
     """
     key = _U32.unpack_from(image, info_base + 4)[0]
     key ^= key_seed
@@ -274,6 +301,9 @@ def decode_packer_info(image, info_base, n, key_seed, validate):
         src = _U32.unpack_from(image, info_base + i * 8)[0]
         dst = _U32.unpack_from(image, info_base + i * 8 + 4)[0]
         dst ^= key
+        if adjust is not None:
+            src = adjust(src)
+            dst = adjust(dst)
         if not validate(image, src, dst, i):
             return None
         entries.append(PACKER_INFO(src, dst))
@@ -355,8 +385,24 @@ class FormatBackend:
         """Return ``(scan_lo, scan_hi, val_lo, val_hi)`` for the scan."""
         raise NotImplementedError
 
+    def adjust_value(self, v):
+        """Map a raw PACKER_INFO word to a native address (identity here)."""
+        return v
+
     def validate_entry(self, image, src, dst, i):
         raise NotImplementedError
+
+    def find_packer_info(self, image, region, n, key_seed):
+        """Locate and decode the PACKER_INFO array; return ``(key, entries)``."""
+        scan_lo, scan_hi, val_lo, val_hi = self.scan_bounds(region)
+        for info_base in scan_packer_info_candidates(
+                image, scan_lo, scan_hi, val_lo, val_hi, n):
+            result = decode_packer_info(image, info_base, n, key_seed,
+                                        self.validate_entry, self.adjust_value)
+            if result is not None:
+                print('key:', hex(result[0]))
+                return result
+        return None
 
     def read_compressed(self, src, source):
         raise NotImplementedError
@@ -565,8 +611,203 @@ class ELFBackend(FormatBackend):
                                  filesz, memsz, flags, align)
 
 
+def get_memory_mapped_macho_image(macho: lief.MachO.Binary):
+    """Build a memory image from Mach-O segments; returns (image, min_vaddr)."""
+    segments = [cmd for cmd in macho.commands
+                if isinstance(cmd, lief.MachO.SegmentCommand)]
+    file_segments = [seg for seg in segments if seg.file_size]
+    if not file_segments:
+        raise ValueError("No file-backed Mach-O segments found")
+
+    min_vaddr = min(seg.virtual_address for seg in file_segments)
+    max_vaddr_end = max(seg.virtual_address + seg.virtual_size
+                        for seg in file_segments)
+    image = bytearray(max_vaddr_end - min_vaddr)
+    for seg in file_segments:
+        offset = seg.virtual_address - min_vaddr
+        content = bytes(seg.content)
+        image[offset:offset + len(content)] = content
+    return image, min_vaddr
+
+
+class MachOBackend(FormatBackend):
+    kind = 'MachO'
+
+    def parse(self, data):
+        try:
+            result = lief.MachO.parse(data)
+        except Exception as e:
+            raise RuntimeError(f"Invalid Mach-O file format: {str(e)}")
+        if result is None or len(result) == 0:
+            raise RuntimeError("No Mach-O binaries found")
+        self._parsed = result
+        return result.at(0)
+
+    def _segments(self):
+        return [cmd for cmd in self.binary.commands
+                if isinstance(cmd, lief.MachO.SegmentCommand)]
+
+    def build_image(self):
+        image, min_vaddr = get_memory_mapped_macho_image(self.binary)
+        self.image_base = min_vaddr
+        return image
+
+    def find_vmp_region(self):
+        rx = (lief.MachO.SegmentCommand.VM_PROTECTIONS.R.value |
+              lief.MachO.SegmentCommand.VM_PROTECTIONS.X.value)
+        for seg in self._segments():
+            if seg.virtual_size == seg.file_size and seg.max_protection == rx:
+                return Region(seg.virtual_address,
+                              seg.virtual_address + seg.virtual_size)
+        return None
+
+    def reserved_regions(self):
+        regions = []
+        for seg in self._segments():
+            if seg.virtual_address and not seg.file_size:
+                regions.append(Region(
+                    seg.virtual_address,
+                    seg.virtual_address + seg.virtual_size))
+        return regions
+
+    def region_count(self, reserved):
+        return len(reserved) + 1
+
+    def _first_load_segment(self):
+        """Return ``(segment_va, first_section_va)`` of the first section."""
+        for seg in self._segments():
+            for section in seg.sections:
+                return seg.virtual_address, section.virtual_address
+        return 0, 0
+
+    def key_seed(self, reserved):
+        base, first_section_address = self._first_load_segment()
+        return base + (first_section_address & 0xFFFFFFFF)
+
+    def scan_bounds(self, region):
+        scan_lo = region.start - self.image_base
+        scan_hi = region.end - self.image_base
+        if self.image_base >= (1 << 32):
+            return (scan_lo, scan_hi, scan_lo, scan_hi)
+        return (scan_lo, scan_hi, region.start, region.end)
+
+    def adjust_value(self, v):
+        return v + self.image_base if self.image_base >= (1 << 32) else v
+
+    def validate_entry(self, image, src, dst, i):
+        """Reject stores whose raw ``Src`` looks like an in-image offset.
+
+        VMProtect stores ``Src`` relative to the high 32 bits of the image base
+        on 64-bit Mach-O, so most raw words happen to fall inside the scan
+        range; requiring the target to be in the image plus discarding raw
+        words that point at non-zero in-image data filters the false candidates
+        the prototype's scanner skipped.
+        """
+        if not (self.image_base <= src < self.image_base + len(image)):
+            return False
+        raw = src - self.image_base if self.image_base >= (1 << 32) else src
+        return not (raw < len(image) and image[raw])
+
+    def read_compressed(self, src, source):
+        return source[src - self.image_base:]
+
+    def target_offset(self, dst):
+        return dst - self.image_base
+
+    def normalize_headers(self, image):
+        """Rewrite segment/section/linkedit file offsets to the image layout.
+
+        The dumped image is flat: every segment lives at ``vmaddr -
+        image_base``. Section headers and ``linkedit_data_command`` entries
+        (notably ``LC_CODE_SIGNATURE``) also carry file offsets that must be
+        remapped, otherwise loaders report invalid section offsets or complain
+        that the code signature is outside ``__LINKEDIT``.
+        """
+        magic = struct.unpack_from('<I', image, 0)[0]
+        is64 = magic == MH_MAGIC_64
+        ncmds = struct.unpack_from('<I', image, 16)[0]
+        off = MH_HEADER64_SIZE if is64 else MH_HEADER32_SIZE
+        segments = []
+        linkedit = []
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack_from('<II', image, off)
+            if cmd == (LC_SEGMENT_64 if is64 else LC_SEGMENT):
+                if is64:
+                    vmaddr = struct.unpack_from('<Q', image, off + 24)[0]
+                    vmsize = struct.unpack_from('<Q', image, off + 32)[0]
+                    fileoff = struct.unpack_from('<Q', image, off + 40)[0]
+                    filesize = struct.unpack_from('<Q', image, off + 48)[0]
+                    nsects = struct.unpack_from('<I', image, off + 64)[0]
+                    sect_off, sect_size = off + 72, 80
+                else:
+                    vmaddr = struct.unpack_from('<I', image, off + 24)[0]
+                    vmsize = struct.unpack_from('<I', image, off + 28)[0]
+                    fileoff = struct.unpack_from('<I', image, off + 32)[0]
+                    filesize = struct.unpack_from('<I', image, off + 36)[0]
+                    nsects = struct.unpack_from('<I', image, off + 48)[0]
+                    sect_off, sect_size = off + 56, 68
+                segments.append((off, is64, vmaddr, vmsize, fileoff, filesize,
+                                 nsects, sect_off, sect_size))
+            elif cmd in MACHO_LINKEDIT_DATA_COMMANDS:
+                linkedit.append(off)
+            off += cmdsize
+
+        file_ranges = [(fileoff, fileoff + filesize, vmaddr)
+                       for _, _, vmaddr, _, fileoff, filesize, _, _, _ in
+                       segments if filesize]
+
+        def remap(dataoff):
+            for lo, hi, vmaddr in file_ranges:
+                if lo <= dataoff < hi:
+                    return vmaddr + (dataoff - lo) - self.image_base
+            return dataoff
+
+        for (off_, seg64, vmaddr, vmsize, _, _, nsects, sect_off,
+             sect_size) in segments:
+            if not (vmaddr >= self.image_base and vmsize):
+                continue
+            if seg64:
+                struct.pack_into('<Q', image, off_ + 40,
+                                 vmaddr - self.image_base)
+                struct.pack_into('<Q', image, off_ + 48, vmsize)
+            else:
+                struct.pack_into('<I', image, off_ + 32,
+                                 vmaddr - self.image_base)
+                struct.pack_into('<I', image, off_ + 36, vmsize)
+
+            # Section file offsets follow the segment's flat layout. ``reloff``
+            # is remapped through the original segment layout when it holds
+            # relocation entries.
+            for i in range(nsects):
+                sec = sect_off + i * sect_size
+                if seg64:
+                    addr = struct.unpack_from('<Q', image, sec + 32)[0]
+                    nreloc = struct.unpack_from('<I', image, sec + 60)[0]
+                    reloff = struct.unpack_from('<I', image, sec + 56)[0]
+                    if addr >= self.image_base:
+                        struct.pack_into('<I', image, sec + 48,
+                                         addr - self.image_base)
+                    if nreloc:
+                        struct.pack_into('<I', image, sec + 56,
+                                         remap(reloff))
+                else:
+                    addr = struct.unpack_from('<I', image, sec + 32)[0]
+                    nreloc = struct.unpack_from('<I', image, sec + 52)[0]
+                    reloff = struct.unpack_from('<I', image, sec + 48)[0]
+                    if addr >= self.image_base:
+                        struct.pack_into('<I', image, sec + 40,
+                                         addr - self.image_base)
+                    if nreloc:
+                        struct.pack_into('<I', image, sec + 48,
+                                         remap(reloff))
+
+        for off_ in linkedit:
+            dataoff, datasize = struct.unpack_from('<II', image, off_ + 8)
+            struct.pack_into('<II', image, off_ + 8, remap(dataoff), datasize)
+
+
 def unpack_image(backend: FormatBackend) -> bytes:
-    """Run the shared PE/ELF unpack pipeline for ``backend``."""
+    """Run the shared PE/ELF/Mach-O unpack pipeline for ``backend``."""
     image = backend.build_image()
     if not image:
         return b''
@@ -581,20 +822,12 @@ def unpack_image(backend: FormatBackend) -> bytes:
 
     n = backend.region_count(reserved)
     key_seed = backend.key_seed(reserved)
-    scan_lo, scan_hi, val_lo, val_hi = backend.scan_bounds(region)
     source = bytes(image)
 
-    entries = None
-    for info_base in scan_packer_info_candidates(
-            image, scan_lo, scan_hi, val_lo, val_hi, n):
-        result = decode_packer_info(image, info_base, n, key_seed,
-                                    backend.validate_entry)
-        if result is not None:
-            key_base, entries = result
-            print('key:', hex(key_base))
-            break
-    if entries is None:
+    result = backend.find_packer_info(image, region, n, key_seed)
+    if result is None:
         return b''
+    _, entries = result
 
     backend.normalize_headers(image)
     decompress_blocks(image, source, entries, backend)
@@ -631,13 +864,104 @@ def unpack_elf(packed_elf_data: bytes) -> bytes:
     return unpack_image(ELFBackend(packed_elf_data))
 
 
+def is_macho(data: bytes) -> bool:
+    """True for thin or fat (universal) Mach-O data."""
+    if len(data) < 4:
+        return False
+    if data[:4] in (MH_MAGIC_LE, MH_MAGIC_64_LE):
+        return True
+    return data[:4] in (FAT_MAGIC_BE, FAT_MAGIC_64_BE)
+
+
+def is_fat_macho(data: bytes) -> bool:
+    return len(data) >= 4 and data[:4] in (FAT_MAGIC_BE, FAT_MAGIC_64_BE)
+
+
+def _fat_macho_archs(data: bytes):
+    """Yield ``(cputype, cpusubtype, align, slice_bytes, is64)`` per fat arch."""
+    magic = int.from_bytes(data[:4], 'big')
+    fat64 = magic == FAT_MAGIC_64
+    nfat = struct.unpack_from('>I', data, 4)[0]
+    for i in range(nfat):
+        if fat64:
+            cputype, cpusubtype, off, size, align, _ = \
+                struct.unpack_from('>IIQQII', data, 8 + i * 32)
+        else:
+            cputype, cpusubtype, off, size, align = \
+                struct.unpack_from('>IIIII', data, 8 + i * 20)
+        yield cputype, cpusubtype, align, data[off:off + size], fat64
+
+
+def _build_fat_macho(slices, fat64):
+    """Assemble ``(cputype, cpusubtype, align, blob)`` slices into a fat file."""
+    magic = FAT_MAGIC_64 if fat64 else FAT_MAGIC
+    entry_size = 32 if fat64 else 20
+    cursor = 8 + entry_size * len(slices)
+    placed = []
+    for cputype, cpusubtype, align, blob in slices:
+        boundary = 1 << (align or 14)
+        cursor = (cursor + boundary - 1) & ~(boundary - 1)
+        placed.append((cputype, cpusubtype, align, cursor, len(blob), blob))
+        cursor += len(blob)
+    out = bytearray(struct.pack('>II', magic, len(slices)))
+    for cputype, cpusubtype, align, off, size, _ in placed:
+        if fat64:
+            out += struct.pack('>IIQQII', cputype, cpusubtype, off, size,
+                               align, 0)
+        else:
+            out += struct.pack('>IIIII', cputype, cpusubtype, off, size, align)
+    for _, _, _, off, _, blob in placed:
+        out += b'\0' * (off - len(out))
+        out += blob
+    return bytes(out)
+
+
+def unpack_macho(packed_macho_data: bytes) -> bytes:
+    """
+    Unpack a VMProtect protected Mach-O file (thin or fat).
+
+    Args:
+        packed_macho_data: Byte content of the packed Mach-O file
+
+    Returns:
+        Unpacked Mach-O file byte content (memory image). A fat input yields a
+        fat output with every slice unpacked.
+    """
+    if not packed_macho_data:
+        raise RuntimeError("Packed Mach-O data is null or empty.")
+    if is_fat_macho(packed_macho_data):
+        fat64 = int.from_bytes(packed_macho_data[:4], 'big') == FAT_MAGIC_64
+        slices = []
+        for cputype, cpusubtype, align, slice_data, _ in \
+                _fat_macho_archs(packed_macho_data):
+            unpacked = unpack_image(MachOBackend(slice_data))
+            slices.append((cputype, cpusubtype, align,
+                           unpacked if unpacked else slice_data))
+        if not slices:
+            return packed_macho_data
+        return _build_fat_macho(slices, fat64)
+    return unpack_image(MachOBackend(packed_macho_data))
+
+
 def detect_backend(data: bytes) -> FormatBackend:
-    """Pick a backend from the file magic (PE 'MZ' or ELF)."""
+    """Pick a backend from the file magic (PE 'MZ', ELF or thin Mach-O)."""
     if data[:2] == b'MZ':
         return PEFileBackend(data)
     if data[:4] == ELF_MAGIC:
         return ELFBackend(data)
-    raise RuntimeError("Unsupported file format: expected PE (MZ) or ELF")
+    if is_macho(data):
+        if is_fat_macho(data):
+            raise RuntimeError("Fat Mach-O must be unpacked via unpack_macho()")
+        return MachOBackend(data)
+    raise RuntimeError("Unsupported file format: expected PE (MZ), ELF or Mach-O")
+
+
+def unpack_auto(data: bytes):
+    """Detect the container format and return ``(kind, unpacked_bytes)``."""
+    if is_fat_macho(data):
+        return 'MachO', unpack_macho(data)
+    backend = detect_backend(data)
+    return backend.kind, unpack_image(backend)
 
 
 def derive_key_hints_at_offset(image, known_plaintext, rva, offset=0):
@@ -1189,7 +1513,7 @@ def classify_sites(pe: lief.PE.Binary, raw_data, import_map, code_section, code_
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('file', help='path to the VMProtect-protected PE/ELF file')
+    parser.add_argument('file', help='path to the VMProtect-protected PE/ELF/Mach-O file')
     parser.add_argument('-k', '--key', type=lambda s: int(s, 0), default=0,
                         help='string decryption key (default: 0, PE only)')
     parser.add_argument('--code-rva', type=lambda s: int(s, 0), default=None,
@@ -1219,11 +1543,9 @@ def main():
         print(f"Packed file loaded: {packed_filepath}, size: {len(packed_data)} bytes")
         
         # Detect the container format and run the matching unpack pipeline
-        backend = detect_backend(packed_data)
-        print(f"Format: {backend.kind}")
-
         print("Unpacking...")
-        unpacked_data = unpack_image(backend)
+        kind, unpacked_data = unpack_auto(packed_data)
+        print(f"Format: {kind}")
         if not unpacked_data:
             print("Unpacking function failed or produced empty output.")
             unpacked_data = packed_data
@@ -1236,7 +1558,7 @@ def main():
             print(f"Unpacked data written to: {unpacked_filepath}")
 
         # Import rebuilding is currently only implemented for PE files.
-        if backend.kind != 'PE':
+        if kind != 'PE':
             return 0
 
         print("Fixing imports...")
